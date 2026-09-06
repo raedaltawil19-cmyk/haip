@@ -1,9 +1,21 @@
 import { Injectable, Inject, NotFoundException, BadRequestException } from '@nestjs/common';
 import { eq, and, ne } from 'drizzle-orm';
 import Decimal from 'decimal.js';
-import { bookings, reservations, guests, ratePlans, roomTypes, folios, rooms } from '@telivityhaip/database';
+import {
+  bookings,
+  reservations,
+  reservationGuests,
+  guests,
+  ratePlans,
+  roomTypes,
+  folios,
+  rooms,
+} from '@telivityhaip/database';
 import { DRIZZLE } from '../../database/database.module';
-import { AvailabilityService } from '../reservation/availability.service';
+import {
+  assertFullStayAvailability,
+  AvailabilityService,
+} from '../reservation/availability.service';
 import { ReservationService } from '../reservation/reservation.service';
 import { WebhookService } from '../webhook/webhook.service';
 import { RatePlanService } from '../rate-plan/rate-plan.service';
@@ -82,39 +94,69 @@ export class ConnectBookingService {
     // the confirmation number is itself a bearer credential for the booking.
     const confirmationNumber = `HAIP-${generateConfirmationToken()}`;
 
-    // 6. Create booking
-    const [booking] = await this.db
-      .insert(bookings)
-      .values({
-        propertyId: dto.propertyId,
-        guestId: guest.id,
-        confirmationNumber,
-        externalConfirmation: dto.externalReference,
-        source: 'agent',
-        channelCode: dto.agentId ?? 'otaip',
-      })
-      .returning();
+    // 6-7. Create the booking and auto-confirmed reservation atomically under
+    // the same room-type mutex used by ReservationService.create/modify. The
+    // early availability check above is only a fast rejection; this locked
+    // re-check is the authoritative guard against two agents consuming the
+    // final room concurrently under READ COMMITTED.
+    const reservation = await this.db.transaction(async (tx: any) => {
+      await this.reservationService.lockInventory(dto.propertyId, dto.roomTypeId, tx);
 
-    // 7. Create reservation — auto-confirm for agent bookings
-    const [reservation] = await this.db
-      .insert(reservations)
-      .values({
+      const lockedAvailability = await this.availabilityService.searchAvailability(
+        dto.propertyId,
+        dto.checkIn,
+        dto.checkOut,
+        dto.roomTypeId,
+        tx,
+      );
+      assertFullStayAvailability(
+        lockedAvailability,
+        dto.roomTypeId,
+        dto.checkIn,
+        dto.checkOut,
+      );
+
+      const [booking] = await tx
+        .insert(bookings)
+        .values({
+          propertyId: dto.propertyId,
+          guestId: guest.id,
+          confirmationNumber,
+          externalConfirmation: dto.externalReference,
+          source: 'agent',
+          channelCode: dto.agentId ?? 'otaip',
+        })
+        .returning();
+
+      const [createdReservation] = await tx
+        .insert(reservations)
+        .values({
+          propertyId: dto.propertyId,
+          bookingId: booking.id,
+          guestId: guest.id,
+          arrivalDate: dto.checkIn,
+          departureDate: dto.checkOut,
+          nights,
+          roomTypeId: dto.roomTypeId,
+          ratePlanId: dto.ratePlanId,
+          totalAmount: totalAmountDec.toFixed(2),
+          currencyCode: ratePlan.currencyCode,
+          adults: dto.adults,
+          children: dto.children ?? 0,
+          specialRequests: dto.specialRequests,
+          status: 'confirmed', // Agent bookings skip pending
+        })
+        .returning();
+
+      await tx.insert(reservationGuests).values({
         propertyId: dto.propertyId,
-        bookingId: booking.id,
+        reservationId: createdReservation.id,
         guestId: guest.id,
-        arrivalDate: dto.checkIn,
-        departureDate: dto.checkOut,
-        nights,
-        roomTypeId: dto.roomTypeId,
-        ratePlanId: dto.ratePlanId,
-        totalAmount: totalAmountDec.toFixed(2),
-        currencyCode: ratePlan.currencyCode,
-        adults: dto.adults,
-        children: dto.children ?? 0,
-        specialRequests: dto.specialRequests,
-        status: 'confirmed', // Agent bookings skip pending
-      })
-      .returning();
+        role: 'primary',
+      });
+
+      return createdReservation;
+    });
 
     // 8. Build nightly breakdown
     const settings = await this.getPropertySettings(dto.propertyId);
@@ -248,8 +290,6 @@ export class ConnectBookingService {
       throw new BadRequestException(`Cannot modify reservation in ${reservation.status} status`);
     }
 
-    const updateFields: Record<string, any> = { updatedAt: new Date() };
-    let costDifferenceDec = new Decimal(0);
     const previousAmountDec = new Decimal(reservation.totalAmount);
     const previousAmount = previousAmountDec.toNumber();
 
@@ -306,10 +346,11 @@ export class ConnectBookingService {
       }
     }
 
-    // Handle simple field updates
-    if (dto.specialRequests !== undefined) updateFields['specialRequests'] = dto.specialRequests;
-    if (dto.adults !== undefined) updateFields['adults'] = dto.adults;
-    if (dto.children !== undefined) updateFields['children'] = dto.children;
+    const reservationChanges: Record<string, any> = {};
+    if (dto.specialRequests !== undefined) reservationChanges['specialRequests'] = dto.specialRequests;
+    if (dto.adults !== undefined) reservationChanges['adults'] = dto.adults;
+    if (dto.children !== undefined) reservationChanges['children'] = dto.children;
+    let currencyCode: string | undefined;
 
     // Handle date/room/rate changes (triggers re-calculation)
     if (dto.checkIn || dto.checkOut || dto.roomTypeId || dto.ratePlanId) {
@@ -330,22 +371,6 @@ export class ConnectBookingService {
         if (!rt) throw new BadRequestException(`room type ${newRoomTypeId} not found in this property`);
       }
 
-      // Re-check availability
-      const availability = await this.availabilityService.searchAvailability(
-        booking.propertyId,
-        newCheckIn,
-        newCheckOut,
-        newRoomTypeId,
-      );
-
-      const minAvailable = availability.length > 0
-        ? Math.min(...availability.map((a) => a.available))
-        : 0;
-
-      if (minAvailable <= 0) {
-        throw new BadRequestException('No availability for modified dates/room type');
-      }
-
       // Re-calculate rate — same-property scoped (was bare-id before).
       const [ratePlan] = await this.db
         .select()
@@ -361,28 +386,26 @@ export class ConnectBookingService {
       const nights = Math.ceil((departure.getTime() - arrival.getTime()) / (1000 * 60 * 60 * 24));
       const newTotalDec = new Decimal(ratePlan.baseAmount).times(nights);
 
-      updateFields['arrivalDate'] = newCheckIn;
-      updateFields['departureDate'] = newCheckOut;
-      updateFields['nights'] = nights;
-      updateFields['roomTypeId'] = newRoomTypeId;
-      updateFields['ratePlanId'] = newRatePlanId;
-      updateFields['totalAmount'] = newTotalDec.toFixed(2);
-      updateFields['currencyCode'] = ratePlan.currencyCode;
-
-      costDifferenceDec = newTotalDec.minus(previousAmountDec);
+      reservationChanges['arrivalDate'] = newCheckIn;
+      reservationChanges['departureDate'] = newCheckOut;
+      reservationChanges['roomTypeId'] = newRoomTypeId;
+      reservationChanges['ratePlanId'] = newRatePlanId;
+      reservationChanges['totalAmount'] = newTotalDec.toFixed(2);
+      currencyCode = ratePlan.currencyCode;
     }
 
-    // Apply update
-    const [updated] = await this.db
-      .update(reservations)
-      .set(updateFields)
-      .where(
-        and(
-          eq(reservations.id, reservation.id),
-          eq(reservations.propertyId, booking.propertyId),
-        ),
-      )
-      .returning();
+    // Use the canonical reservation mutation path. It owns the inventory lock,
+    // full-stay availability check, rate restriction check, tenant scoping, and
+    // accepted-pricing safeguards, so Connect modifications cannot race a
+    // dashboard/API modification for the final room.
+    const amendment = await this.reservationService.modify(
+      reservation.id,
+      booking.propertyId,
+      reservationChanges,
+      currencyCode === undefined ? undefined : { currencyCode },
+    );
+    const updated = amendment.reservation;
+    const costDifferenceDec = new Decimal(updated.totalAmount).minus(previousAmountDec);
 
     // Emit webhook
     await this.webhookService.emit(

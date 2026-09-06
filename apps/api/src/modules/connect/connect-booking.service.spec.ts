@@ -7,6 +7,7 @@ describe('ConnectBookingService', () => {
   let mockDb: any;
   let mockAvailabilityService: any;
   let mockWebhookService: any;
+  let mockReservationService: any;
 
   const mockRatePlan = {
     id: 'rp-1',
@@ -20,6 +21,7 @@ describe('ConnectBookingService', () => {
   beforeEach(() => {
     let insertCallCount = 0;
     mockDb = {
+      transaction: vi.fn().mockImplementation(async (callback) => callback(mockDb)),
       select: vi.fn().mockImplementation(() => ({
         from: vi.fn().mockReturnValue({
           where: vi.fn().mockResolvedValue([]),
@@ -54,7 +56,18 @@ describe('ConnectBookingService', () => {
 
     mockWebhookService = { emit: vi.fn().mockResolvedValue(undefined) };
     const mockRatePlanService = { assertSellable: vi.fn().mockResolvedValue(undefined) };
-    const mockReservationService = {
+    mockReservationService = {
+      lockInventory: vi.fn().mockResolvedValue(undefined),
+      modify: vi.fn().mockImplementation(async (_id, propertyId, dto, internal) => ({
+        reservation: {
+          id: 'res-1',
+          propertyId,
+          status: 'confirmed',
+          totalAmount: dto.totalAmount ?? '399.98',
+          currencyCode: internal?.currencyCode ?? 'USD',
+          updatedAt: new Date(),
+        },
+      })),
       cancel: vi.fn().mockResolvedValue({
         id: 'res-1',
         status: 'cancelled',
@@ -119,6 +132,75 @@ describe('ConnectBookingService', () => {
       expect(result.confirmationNumber).toBeDefined();
       expect(result.confirmationCodes.external).toBe('OTAIP-123');
       expect(result.nightlyBreakdown).toHaveLength(2);
+      expect(mockDb.insert).toHaveBeenCalledTimes(4); // guest + booking + reservation + roster
+    });
+
+    it('should lock inventory and re-check availability inside the booking transaction', async () => {
+      let selectCallCount = 0;
+      mockDb.select.mockImplementation(() => ({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockImplementation(() => {
+            selectCallCount++;
+            if (selectCallCount === 1) return Promise.resolve([mockRatePlan]);
+            if (selectCallCount === 2) return Promise.resolve([]);
+            if (selectCallCount === 3) return Promise.resolve([{ settings: {} }]);
+            return Promise.resolve([]);
+          }),
+        }),
+      }));
+
+      await service.book({
+        propertyId: 'prop-1',
+        roomTypeId: 'rt-1',
+        ratePlanId: 'rp-1',
+        checkIn: '2024-06-01',
+        checkOut: '2024-06-03',
+        guestFirstName: 'John',
+        guestLastName: 'Smith',
+        adults: 2,
+      });
+
+      expect(mockDb.transaction).toHaveBeenCalledOnce();
+      expect(mockReservationService.lockInventory).toHaveBeenCalledWith('prop-1', 'rt-1', mockDb);
+      expect(mockAvailabilityService.searchAvailability).toHaveBeenLastCalledWith(
+        'prop-1',
+        '2024-06-01',
+        '2024-06-03',
+        'rt-1',
+        mockDb,
+      );
+    });
+
+    it('should reject when locked availability is consumed after the early check', async () => {
+      mockAvailabilityService.searchAvailability
+        .mockResolvedValueOnce([
+          { roomTypeId: 'rt-1', date: '2024-06-01', totalRooms: 1, sold: 0, available: 1, overbookingBuffer: 0 },
+        ])
+        .mockResolvedValueOnce([
+          { roomTypeId: 'rt-1', date: '2024-06-01', totalRooms: 1, sold: 1, available: 0, overbookingBuffer: 0 },
+        ]);
+      mockDb.select.mockImplementation(() => ({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValueOnce([mockRatePlan]),
+        }),
+      }));
+
+      await expect(service.book({
+        propertyId: 'prop-1',
+        roomTypeId: 'rt-1',
+        ratePlanId: 'rp-1',
+        checkIn: '2024-06-01',
+        checkOut: '2024-06-02',
+        guestFirstName: 'Jane',
+        guestLastName: 'Doe',
+        adults: 1,
+      })).rejects.toThrow(BadRequestException);
+
+      expect(mockDb.transaction).toHaveBeenCalledOnce();
+      // The guest may be created before inventory contention is resolved, but
+      // neither a booking nor a reservation is inserted after the locked
+      // availability check fails.
+      expect(mockDb.insert).toHaveBeenCalledTimes(1);
     });
 
     it('should reuse existing guest matched by email', async () => {
@@ -163,7 +245,8 @@ describe('ConnectBookingService', () => {
       });
 
       expect(result.success).toBe(true);
-      // Only 2 inserts (booking + reservation), not 3 (guest skipped)
+      // Only booking + reservation use returning(); the roster insert is also
+      // issued, while a new guest insert is skipped.
       expect(insertCount).toBe(2);
     });
 
@@ -209,8 +292,8 @@ describe('ConnectBookingService', () => {
       });
 
       expect(result.success).toBe(true);
-      // A fresh guest row is created (guest + booking + reservation = 3 inserts),
-      // NOT linked to the foreign-property guest.
+      // A fresh guest row is created (three returning inserts); the roster insert
+      // is issued separately and the foreign-property guest is never reused.
       expect(insertCount).toBe(3);
     });
 
@@ -414,7 +497,7 @@ describe('ConnectBookingService', () => {
       expect(result.costDifference).toBe(0);
     });
 
-    it('should re-check availability for date changes', async () => {
+    it('should delegate date changes to the locked canonical modification path', async () => {
       let selectCallCount = 0;
       mockDb.select.mockImplementation(() => ({
         from: vi.fn().mockReturnValue({
@@ -438,7 +521,19 @@ describe('ConnectBookingService', () => {
       });
 
       expect(result.success).toBe(true);
-      expect(mockAvailabilityService.searchAvailability).toHaveBeenCalled();
+      expect(mockReservationService.modify).toHaveBeenCalledWith(
+        'res-1',
+        'prop-1',
+        expect.objectContaining({
+          arrivalDate: '2024-06-01',
+          departureDate: '2024-06-04',
+          roomTypeId: 'rt-1',
+          ratePlanId: 'rp-1',
+          totalAmount: '599.97',
+        }),
+        { currencyCode: 'USD' },
+      );
+      expect(mockAvailabilityService.searchAvailability).not.toHaveBeenCalled();
     });
 
     it('forks a property-local guest on name change when the guest is shared with another property', async () => {
